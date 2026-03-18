@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace League\Flysystem\ReadOnly;
 
 use League\Flysystem\Config;
@@ -14,9 +16,10 @@ use League\Flysystem\UnableToMoveFile;
 use League\Flysystem\UnableToSetVisibility;
 use League\Flysystem\UnableToWriteFile;
 use League\Flysystem\UrlGeneration\PublicUrlGenerator;
-use PHPUnit\Framework\TestCase;
 
 use function ltrim;
+
+use PHPUnit\Framework\TestCase;
 
 class ReadOnlyFilesystemAdapterTest extends TestCase
 {
@@ -158,7 +161,7 @@ class ReadOnlyFilesystemAdapterTest extends TestCase
      */
     public function generating_a_public_url(): void
     {
-        $adapter = new class() extends InMemoryFilesystemAdapter implements PublicUrlGenerator {
+        $adapter = new class () extends InMemoryFilesystemAdapter implements PublicUrlGenerator {
             public function publicUrl(string $path, Config $config): string
             {
                 return 'memory://' . ltrim($path, '/');
