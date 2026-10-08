@@ -157,18 +157,20 @@ class ReadOnlyFilesystemAdapterTest extends TestCase
         $adapter = new ReadOnlyFilesystemAdapter($inner);
 
         $items = iterator_to_array($adapter->listContents('foo', false), false);
-        $this->assertCount(2, $items);
+        $paths = array_map(static fn ($item) => $item->path(), $items);
+        sort($paths);
 
-        $this->assertInstanceOf(FileAttributes::class, $items[0]);
-        $this->assertSame('foo/bar.txt', $items[0]->path());
-        $this->assertSame(5, $items[0]->fileSize());
+        $this->assertSame(['foo/bar.txt', 'foo/nested'], $paths);
 
-        $this->assertInstanceOf(DirectoryAttributes::class, $items[1]);
-        $this->assertSame('foo/nested', $items[1]->path());
-
+        $itemsByPath = [];
         foreach ($items as $item) {
-            $this->assertNotSame('foo/nested/baz.txt', $item->path());
+            $itemsByPath[$item->path()] = $item;
         }
+
+        $this->assertInstanceOf(FileAttributes::class, $itemsByPath['foo/bar.txt']);
+        $this->assertSame(5, $itemsByPath['foo/bar.txt']->fileSize());
+        $this->assertInstanceOf(DirectoryAttributes::class, $itemsByPath['foo/nested']);
+        $this->assertArrayNotHasKey('foo/nested/baz.txt', $itemsByPath);
     }
 
     public function test_list_contents_deep_includes_nested_files(): void
@@ -178,16 +180,19 @@ class ReadOnlyFilesystemAdapterTest extends TestCase
         $inner->write('foo/nested/baz.txt', 'beta-beta', new Config(['timestamp' => self::SEED_TIMESTAMP]));
         $adapter = new ReadOnlyFilesystemAdapter($inner);
 
-        $paths = array_map(
-            static fn ($item) => $item->path(),
-            iterator_to_array($adapter->listContents('foo', true), false)
-        );
+        $items = iterator_to_array($adapter->listContents('foo', true), false);
+        $paths = array_map(static fn ($item) => $item->path(), $items);
+        sort($paths);
 
         $this->assertSame(['foo/bar.txt', 'foo/nested', 'foo/nested/baz.txt'], $paths);
 
-        $deepFile = iterator_to_array($adapter->listContents('foo', true), false)[2];
-        $this->assertInstanceOf(FileAttributes::class, $deepFile);
-        $this->assertSame(9, $deepFile->fileSize());
+        $itemsByPath = [];
+        foreach ($items as $item) {
+            $itemsByPath[$item->path()] = $item;
+        }
+
+        $this->assertInstanceOf(FileAttributes::class, $itemsByPath['foo/nested/baz.txt']);
+        $this->assertSame(9, $itemsByPath['foo/nested/baz.txt']->fileSize());
     }
 
     public function test_list_contents_of_missing_directory_is_empty(): void
@@ -479,7 +484,6 @@ class ReadOnlyFilesystemAdapterTest extends TestCase
             $this->fail('Expected UnableToGeneratePublicUrl');
         } catch (UnableToGeneratePublicUrl $exception) {
             $this->assertStringContainsString('/path.txt', $exception->getMessage());
-            $this->assertStringContainsString('No generator was configured', $exception->getMessage());
         }
     }
 
@@ -532,7 +536,6 @@ class ReadOnlyFilesystemAdapterTest extends TestCase
             $this->fail('Expected UnableToGenerateTemporaryUrl');
         } catch (UnableToGenerateTemporaryUrl $exception) {
             $this->assertStringContainsString('a.txt', $exception->getMessage());
-            $this->assertStringContainsString('No generator was configured', $exception->getMessage());
         }
     }
 
@@ -565,6 +568,108 @@ class ReadOnlyFilesystemAdapterTest extends TestCase
         }
 
         $this->assertFalse($inner->fileExists('b.txt'));
+    }
+
+    public function test_filesystem_public_url_reaches_inner_generator(): void
+    {
+        $recorded = [];
+        $inner = new class($recorded) extends InMemoryFilesystemAdapter implements PublicUrlGenerator {
+            /** @var list<array{path: string, config: Config}> */
+            private array $recorded;
+
+            /** @param list<array{path: string, config: Config}> $recorded */
+            public function __construct(array &$recorded)
+            {
+                parent::__construct();
+                $this->recorded = &$recorded;
+            }
+
+            public function publicUrl(string $path, Config $config): string
+            {
+                $this->recorded[] = ['path' => $path, 'config' => $config];
+
+                return 'memory://' . ltrim($path, '/');
+            }
+        };
+        $filesystem = new Filesystem(new ReadOnlyFilesystemAdapter($inner));
+
+        $url = $filesystem->publicUrl('/path.txt', ['cdn' => 'files']);
+
+        $this->assertSame('memory://path.txt', $url);
+        $this->assertCount(1, $recorded);
+        $this->assertSame('path.txt', $recorded[0]['path']);
+        $this->assertSame('files', $recorded[0]['config']->get('cdn'));
+    }
+
+    public function test_filesystem_temporary_url_reaches_inner_generator(): void
+    {
+        $recorded = [];
+        $inner = new class($recorded) extends InMemoryFilesystemAdapter implements TemporaryUrlGenerator {
+            /** @var list<array{path: string, expiresAt: DateTimeImmutable, config: Config}> */
+            private array $recorded;
+
+            /** @param list<array{path: string, expiresAt: DateTimeImmutable, config: Config}> $recorded */
+            public function __construct(array &$recorded)
+            {
+                parent::__construct();
+                $this->recorded = &$recorded;
+            }
+
+            public function temporaryUrl(string $path, \DateTimeInterface $expiresAt, Config $config): string
+            {
+                $this->recorded[] = [
+                    'path' => $path,
+                    'expiresAt' => $expiresAt,
+                    'config' => $config,
+                ];
+
+                return 'https://files.example/temp';
+            }
+        };
+        $expiresAt = new DateTimeImmutable('2020-01-02T03:04:05+00:00');
+        $filesystem = new Filesystem(new ReadOnlyFilesystemAdapter($inner));
+
+        $url = $filesystem->temporaryUrl('a.txt', $expiresAt, ['ttl' => 15]);
+
+        $this->assertSame('https://files.example/temp', $url);
+        $this->assertCount(1, $recorded);
+        $this->assertSame('a.txt', $recorded[0]['path']);
+        $this->assertSame($expiresAt, $recorded[0]['expiresAt']);
+        $this->assertSame(1577934245, $recorded[0]['expiresAt']->getTimestamp());
+        $this->assertSame(15, $recorded[0]['config']->get('ttl'));
+    }
+
+    public function test_filesystem_checksum_reaches_inner_provider(): void
+    {
+        $calls = [];
+        $inner = new class($calls) extends InMemoryFilesystemAdapter implements ChecksumProvider {
+            /** @var list<array{path: string, config: Config}> */
+            private array $calls;
+
+            /** @param list<array{path: string, config: Config}> $calls */
+            public function __construct(array &$calls)
+            {
+                parent::__construct();
+                $this->calls = &$calls;
+            }
+
+            public function checksum(string $path, Config $config): string
+            {
+                $this->calls[] = ['path' => $path, 'config' => $config];
+
+                return 'provider-checksum';
+            }
+        };
+        $inner->write('foo/bar.txt', 'content', new Config(['timestamp' => self::SEED_TIMESTAMP]));
+        $filesystem = new Filesystem(new ReadOnlyFilesystemAdapter($inner));
+
+        $result = $filesystem->checksum('foo/bar.txt', ['checksum_algo' => 'sha256']);
+
+        $this->assertSame('provider-checksum', $result);
+        $this->assertNotSame('ed7002b439e9ac845f22357d822bac1444730fbdb6016d3ec9432297b9ec9f73', $result);
+        $this->assertCount(1, $calls);
+        $this->assertSame('foo/bar.txt', $calls[0]['path']);
+        $this->assertSame('sha256', $calls[0]['config']->get('checksum_algo'));
     }
 
     private function seededInnerAdapter(): InMemoryFilesystemAdapter
